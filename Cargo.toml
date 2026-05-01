@@ -1,0 +1,9 @@
+[package]
+name = "portscanner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.52.1", features = ["rt", "rt-multi-thread", "macros"] }
+phf = { version = "0.11", features = ["macros"] }
+surge-ping = "0.8.4"
