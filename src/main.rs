@@ -1,13 +1,13 @@
 use std::{env};
 use std::error::Error;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use surge_ping::{Client, Config, PingIdentifier, PingSequence};
 use std::string::ToString;
-use tokio::time::timeout;
 use tokio::task;
+use tokio::net::TcpStream;
 use crate::ports::PORTS;
 
 mod ports;
@@ -30,6 +30,7 @@ struct ResultsSweep {
     alive_hosts: Vec<Ipv4Addr>,
 }
 
+#[derive(Clone, Debug)]
 struct ResultsSingle {
     ip: Ipv4Addr,
     open_ports: Vec<u16>,
@@ -41,10 +42,17 @@ async fn main() {
 
     let config = ConfigConnection::build(args.clone()).unwrap();
 
+    let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
     if let Some(_) = config.subnet {
-        show_summary_sweep(sweep(config).await);
+        let results = sweep(config.clone()).await;
+        if !config.options.contains(&"-s".to_string()) {
+            show_summary_sweep(results, config.get_port());
+        }
+        let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        println!("Duration: {:?}", end - start);
     } else {
-        println!("{:?}", scan_ip(Ipv4Addr::from_str(config.ip.to_string().as_str()).unwrap(), config.get_port()).open_ports);
+        println!("{:?}", scan_ip(Ipv4Addr::from_str(config.ip.to_string().as_str()).unwrap(), config.get_port()).await.open_ports);
     }
 }
 
@@ -58,9 +66,11 @@ async fn sweep(config: ConfigConnection) -> ResultsSweep{
     let mut handles = Vec::new();
     let mut nets: Vec<Subnet> = Vec::new();
 
-    let step = 64; // Lower the step, the faster but more resource intensive the program will be
+    let step = 8; // Lower the step, the faster but more resource intensive the program will be
 
     println!("Beginning sweep of {} hosts", subnet.max_hosts);
+
+    let ping_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
     for _ in 0..subnet.clone().max_hosts / step {
         nets.push(subnet.clone());
@@ -75,62 +85,90 @@ async fn sweep(config: ConfigConnection) -> ResultsSweep{
     }
 
     for handle in handles {
-        let mut result = handle.await.unwrap();
-        hosts.append(&mut result);
+        let result = handle.await.unwrap();
+        for ip in result.clone() {
+            hosts.push(ip);
+        }
     }
 
-    println!("Ping scan complete, found {} alive hosts, beginning port scan of each.", hosts.len());
+    let ping_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+    println!("Ping scan finished in {:?}s, found {} alive hosts, beginning port scan of each.", (ping_end - ping_start).as_secs(), hosts.len());
 
     let mut handles_scan = Vec::new();
 
     let mut hosts_mod = hosts.clone();
 
-    let host_step = 4; // Higher the number, faster but more resource intensive program will be
+    let mut host_step = subnet.clone().max_hosts / 16; // Higher the number, faster but more resource intensive program will be
 
-    let port = config.clone().get_port();
+    let len = hosts.len();
+
+    let port = config.get_port();
+
+    let mut hosts_split: Vec<Vec<Ipv4Addr>> = Vec::new();
+
+    if host_step > len {
+        host_step = len;
+    }
 
     for _ in 0..host_step {
-        hosts_mod = hosts_mod.split_off(hosts.len() / host_step);
-        for host in hosts_mod.clone() {
-            handles_scan.push(task::spawn(async move {
-                scan_ip(host, port)
-            }))
-        }
+        hosts_split.push(hosts_mod.split_at(len / host_step).0.to_vec());
+        hosts_mod = hosts_mod.split_at(len / host_step).1.to_vec();
+    }
+
+    for range in hosts_split.clone() {
+        handles_scan.push(task::spawn(async move{
+            sweep_net(range, port).await
+        }))
     }
 
     for handle in handles_scan {
-        let result = handle.await.unwrap();
-        ip_map.insert(result.ip, result.open_ports);
+        let results = handle.await.unwrap();
+        for result in results {
+            ip_map.insert(result.ip, result.open_ports);
+        }
     }
 
 
     ResultsSweep { ip_map, alive_hosts: hosts }
 }
 
-fn show_summary_sweep(results: ResultsSweep) {
+fn show_summary_sweep(results: ResultsSweep, port: Option<usize>) {
     println!("Scan results: ");
     println!("======================");
+    let msg = if port.is_none() {
+        "All 1000 ports closed."
+    } else {
+        &*("PORT    STATE       SERVICE\n".to_owned() + port.unwrap().to_string().as_str() + " \0\0\0  closed \0\0        " + PORTS.get(&(port.unwrap() as u16)).unwrap_or(&"None"))
+    };
     for host in results.alive_hosts {
-        println!("Scan report for {host}\nHost is up");
+        println!("Scan report for {host}");
         if let Some(ports_open) = results.ip_map.get(&host) {
             if ports_open.is_empty() {
-                println!("All 1000 TCP ports closed.");
+                println!("{}", msg);
             }
             for port in ports_open {
                 println!("PORT      STATE       SERVICE");
                 println!("{port}/tcp  open         {:?}", PORTS.get(port));
             }
         } else {
-            println!("All 1000 TCP ports closed.");
+            println!("{}", msg);
         }
         println!();
     }
 }
 
+async fn resolvable(ip: Ipv4Addr, port: u32) -> Result<TcpStream, Box<dyn Error + Send + Sync>> {
+    tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(format!("{}:{}", ip, port)))
+        .await?
+        .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)
+}
+
 async fn get_alive_hosts(hosts: usize, ip_init: Ipv4Addr) -> Vec<Ipv4Addr> {
-    let mut alive_hosts: Vec<Ipv4Addr> = Vec::new();
+    let mut alive_hosts = Vec::new();
 
     let mut ip = ip_init;
+
 
     for _ in 0..hosts {
         if let Ok(_) = host_up(ip).await {
@@ -147,14 +185,11 @@ async fn host_up(ip: Ipv4Addr) -> Result<(), Box<dyn Error>> {
     let client = Client::new(&Config::default())?;
 
     let mut pinger = client.pinger(IpAddr::from(ip), PingIdentifier(0)).await;
-    pinger.timeout(Duration::from_millis(200));
+    pinger.timeout(Duration::from_millis(3500));
 
-    match timeout(Duration::from_millis(200), pinger.ping(PingSequence(0), &[0])).await {
-        Ok(Ok((_, _))) => {
+    match pinger.ping(PingSequence(0), &[ip.octets()[3]]).await {
+        Ok(_) => {
             Ok(())
-        }
-        Ok(Err(e)) => {
-            Err(Box::from(e))
         },
         Err(e) => {
             Err(Box::from(e))
@@ -193,24 +228,35 @@ fn find_ip_start(ip: Ipv4Addr, cidr: usize) -> Ipv4Addr {
     Ipv4Addr::from_str(ip_start.as_str()).unwrap()
 }
 
-fn scan_ip(ip: Ipv4Addr, port: Option<usize>) -> ResultsSingle {
-    let mut open_ports: Vec<u16> = Vec::new();
-    let mut port_range = (0, 1023);
-    if let Some(po) = port {
-        port_range = (po, po + 1);
+async fn sweep_net(hosts: Vec<Ipv4Addr>, port: Option<usize>) -> Vec<ResultsSingle> {
+    let mut results: Vec<ResultsSingle> = Vec::new();
+
+    for host in hosts {
+        results.push(scan_ip(host, port).await);
     }
-    let mut socket = SocketAddr::new(IpAddr::from(ip), port_range.0 as u16);
 
-
-    for p in port_range.0..port_range.1 {
-        socket.set_port(p as u16);
-        if let Ok(_stream) = TcpStream::connect_timeout(&socket, Duration::new(0, 200)) {
-            open_ports.push(p as u16);
-        }
-    }
-    ResultsSingle { ip, open_ports }
-
+    results
 }
+
+async fn scan_ip(ip: Ipv4Addr, port: Option<usize>) -> ResultsSingle {
+    let mut open_ports: Vec<u16> = Vec::new();
+
+    if let Some(p) = port {
+        if let Ok(_) = resolvable(ip, p as u32).await {
+            return ResultsSingle { ip, open_ports: vec![p as u16] };
+        }
+        return ResultsSingle { ip, open_ports: Vec::new() };
+    }
+
+    for p in PORTS.keys() {
+            if let Ok(_) = resolvable(ip, *p as u32).await {
+                open_ports.push(*p);
+            }
+        }
+        ResultsSingle { ip, open_ports }
+    }
+
+
 
 impl ConfigConnection {
     fn build(args: Vec<String>) -> Result<Self, Box<dyn Error>> {
