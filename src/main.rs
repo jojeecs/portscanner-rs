@@ -6,18 +6,38 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use surge_ping::{Client, Config, PingIdentifier, PingSequence};
 use std::string::ToString;
+use regex::Regex;
 use tokio::task;
 use tokio::net::TcpStream;
+use crate::Argument::{AllOnline, OutputFile, PingScan, Port, Timing, Verbose, CIDR, IP};
 use crate::ports::PORTS;
 
 mod ports;
 
-#[derive(Clone)]
-struct ConfigConnection {
-    ip: IpAddr,
-    subnet: Option<Subnet>,
-    options: Vec<String>,
+const TIMING_QUIET: &'static str = "T1";
+const TIMING_NORMAL: &'static str = "T2";
+const TIMING_LOUD: &'static str = "T3";
+const TIMING_AGGRESSIVE: &'static str = "T4";
+const TIMING_INSANE: &'static str = "T5";
+
+#[derive(Clone, Debug)]
+#[derive(PartialEq)]
+enum Argument {
+    IP(Ipv4Addr),
+    CIDR(u32),
+    Port(u32),
+    Verbose,
+    Timing(String),
+    OutputFile(String),
+    PingScan,
+    AllOnline,
 }
+
+#[derive(Clone, Debug)]
+struct Instance {
+    options: Vec<Argument>,
+}
+
 
 #[derive(Clone, Debug)]
 struct Subnet {
@@ -40,26 +60,69 @@ struct ResultsSingle {
 async fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let config = ConfigConnection::build(args.clone()).unwrap();
+    let config = Instance::build(args.clone()).unwrap();
 
     let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
-    if let Some(_) = config.subnet {
+    if let Some(_) = config.options.iter().find(|x| {
+        if let CIDR(_) = x {
+            return true;
+        }
+        false
+    }) {
         let results = sweep(config.clone()).await;
-        if !config.options.contains(&"-s".to_string()) {
-            show_summary_sweep(results, config.get_port());
+        if !config.options.contains(&Timing(TIMING_QUIET.to_string())) {
+            show_summary_sweep(results, Some(config.get_port()));
         }
         let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         println!("Duration: {:?}", end - start);
     } else {
-        println!("{:?}", scan_ip(Ipv4Addr::from_str(config.ip.to_string().as_str()).unwrap(), config.get_port()).await.open_ports);
+        
     }
 }
 
-async fn sweep(config: ConfigConnection) -> ResultsSweep{
+fn parse_args(string_args: Vec<String>) -> Vec<Argument> {
+    let mut args: Vec<Argument> = Vec::new();
+
+    let mut iterator = string_args.iter().skip(1);
+
+
+
+    while let Some(arg) = iterator.next() {
+        if arg.eq("-p") || arg.eq("--port") {
+            args.push(Port(str::parse::<u32>(iterator.next().expect("Invalid port number passed")).expect("Invalid port number passed")));
+        }  else if arg.eq("-v") {
+            args.push(Verbose);
+        } else if arg.contains(&"-T".to_string()) {
+            args.push(Timing(arg.to_string()));
+        } else if arg.eq("-O") || arg.eq("--output") {
+            args.push(OutputFile(arg.to_string()));
+        } else if arg.eq("-sn") {
+            args.push(PingScan);
+        } else if arg.eq("-Pn") {
+            args.push(AllOnline);
+        } else if Regex::new(r"[(0-9)+].[(0-9)+].[(0-9)+].[(0-9)+]").unwrap().is_match(arg.as_str()) {
+            if arg.contains("/") {
+                let mut arg_itr = arg.split("/");
+
+                let ip_str = arg_itr.clone().next().unwrap();
+
+                arg_itr.next();
+
+                let cidr = arg_itr.clone().next().unwrap().parse::<u32>().unwrap();
+                args.push(IP(Ipv4Addr::from_str(ip_str).unwrap()));
+                args.push(CIDR(cidr))
+            }
+        }
+    }
+
+    args
+}
+
+async fn sweep(config: Instance) -> ResultsSweep{
     let mut ip_map: HashMap<Ipv4Addr, Vec<u16>> = HashMap::new();
 
-    let subnet = config.clone().subnet.unwrap();
+    let subnet = config.get_subnet();
 
     let mut hosts: Vec<Ipv4Addr> = Vec::new();
 
@@ -103,7 +166,7 @@ async fn sweep(config: ConfigConnection) -> ResultsSweep{
 
     let len = hosts.len();
 
-    let port = config.get_port();
+    let port: u32 = config.get_port();
 
     let mut hosts_split: Vec<Vec<Ipv4Addr>> = Vec::new();
 
@@ -118,7 +181,7 @@ async fn sweep(config: ConfigConnection) -> ResultsSweep{
 
     for range in hosts_split.clone() {
         handles_scan.push(task::spawn(async move{
-            sweep_net(range, port).await
+            sweep_net(range, Some(port)).await
         }))
     }
 
@@ -129,11 +192,10 @@ async fn sweep(config: ConfigConnection) -> ResultsSweep{
         }
     }
 
-
     ResultsSweep { ip_map, alive_hosts: hosts }
 }
 
-fn show_summary_sweep(results: ResultsSweep, port: Option<usize>) {
+fn show_summary_sweep(results: ResultsSweep, port: Option<u32>) {
     println!("Scan results: ");
     println!("======================");
     let msg = if port.is_none() {
@@ -159,7 +221,7 @@ fn show_summary_sweep(results: ResultsSweep, port: Option<usize>) {
 }
 
 async fn resolvable(ip: Ipv4Addr, port: u32) -> Result<TcpStream, Box<dyn Error + Send + Sync>> {
-    tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(format!("{}:{}", ip, port)))
+    tokio::time::timeout(Duration::from_millis(600), TcpStream::connect(format!("{}:{}", ip, port)))
         .await?
         .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)
 }
@@ -228,7 +290,7 @@ fn find_ip_start(ip: Ipv4Addr, cidr: usize) -> Ipv4Addr {
     Ipv4Addr::from_str(ip_start.as_str()).unwrap()
 }
 
-async fn sweep_net(hosts: Vec<Ipv4Addr>, port: Option<usize>) -> Vec<ResultsSingle> {
+async fn sweep_net(hosts: Vec<Ipv4Addr>, port: Option<u32>) -> Vec<ResultsSingle> {
     let mut results: Vec<ResultsSingle> = Vec::new();
 
     for host in hosts {
@@ -238,56 +300,75 @@ async fn sweep_net(hosts: Vec<Ipv4Addr>, port: Option<usize>) -> Vec<ResultsSing
     results
 }
 
-async fn scan_ip(ip: Ipv4Addr, port: Option<usize>) -> ResultsSingle {
+async fn scan_ip(ip: Ipv4Addr, port: Option<u32>) -> ResultsSingle {
     let mut open_ports: Vec<u16> = Vec::new();
 
     if let Some(p) = port {
-        if let Ok(_) = resolvable(ip, p as u32).await {
+        if let Ok(_) = resolvable(ip, p ).await {
             return ResultsSingle { ip, open_ports: vec![p as u16] };
         }
         return ResultsSingle { ip, open_ports: Vec::new() };
     }
 
     for p in PORTS.keys() {
-            if let Ok(_) = resolvable(ip, *p as u32).await {
-                open_ports.push(*p);
-            }
+        if let Ok(_) = resolvable(ip, *p as u32).await {
+            open_ports.push(*p);
         }
-        ResultsSingle { ip, open_ports }
     }
+    ResultsSingle { ip, open_ports }
+}
 
 
 
-impl ConfigConnection {
+impl Instance {
     fn build(args: Vec<String>) -> Result<Self, Box<dyn Error>> {
         if args.len() < 2 {
-            return Ok(ConfigConnection { ip: IpAddr::from_str("127.0.0.1")?, subnet: None, options: vec![] })
+            return Ok(Instance { options: Vec::new() });
         }
 
-        if args.get(1).unwrap().contains("/") {
-            let mut arg_itr = args.get(1).unwrap().split("/");
+        let options = parse_args(args);
 
-            let ip_str = arg_itr.clone().next().unwrap();
-
-            arg_itr.next();
-
-            let cidr = arg_itr.clone().next().unwrap().parse::<usize>()?;
-
-            let subnet = Subnet { first_ip: find_ip_start(Ipv4Addr::from_str(ip_str)?, cidr), max_hosts: 2_usize.pow((32 - cidr) as u32) };
-
-            return Ok(ConfigConnection { ip: IpAddr::from_str(ip_str)?, subnet: Some(subnet), options: args.clone().split_off(2) });
-
-        }
-
-        Ok(ConfigConnection { ip: IpAddr::from_str(args.get(1).unwrap())?, subnet: None, options: args.clone().split_off(2)})
+        Ok(Instance { options })
     }
 
-    fn get_port(&self) -> Option<usize> {
-        if self.options.contains(&"-p".to_string()) {
-            let idx = self.options.iter().position(|n| n == "-p").unwrap();
-            return Some(str::parse::<usize>(self.options.get(idx + 1).unwrap()).unwrap());
+    fn get_subnet(&self) -> Subnet {
+
+        let mut ip_start: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+        let mut cidr = 32;
+
+        if let IP(ip) = self.options.iter().find(|x| {
+            if let IP(_) = x {
+                return true;
+            }
+            false
+        }).unwrap() {
+            if let CIDR(num) = self.options.iter().find(|x1| {
+                if let CIDR(_) = x1 {
+                    return true;
+                }
+                false
+            }).unwrap() {
+                cidr = *num;
+                ip_start = find_ip_start(*ip, *num as usize);
+
+            }
         }
 
-        None
+        Subnet { first_ip: ip_start, max_hosts: 2_u32.pow(32 - cidr) as usize }
+    }
+
+    fn get_port(&self) -> u32 {
+        if let Port(num) = self.options.iter().find(|x| {
+            if let Port(_) = x {
+                return true;
+            }
+            false
+        }).unwrap() {
+            return *num;
+        }
+
+
+        0
     }
 }
